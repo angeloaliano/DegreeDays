@@ -1,0 +1,1864 @@
+
+using Printf, Random,JuMP, Gurobi, Printf
+using FileIO, JLD2, LinearAlgebra
+using Statistics
+rng = MersenneTwister(2020);
+
+include("Dados200_dono.jl")
+include("Graus_dias_diario.jl")
+include("Graus_dias_acumulado.jl")
+CPUtime=3600
+
+#Linear#########################################################################
+function Modelo_linear_Min_z1(a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.005)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, v1[i in 1:m-1,h in H] >=0)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, v2[i in 1:m-1,h in H] >=0)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    x[i,j] <= sum(z[i,j,h] for h in H)
+    )
+
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    sum(z[i,j,h] for h in H) <= Φ*x[i,j]
+    )
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    zvalue = objective_value(modelo)
+    X = value.(x)
+    Z = value.(z)
+    Ω = value.(ω)
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+
+    return (zvalue,X,Z,Ω,Tempo,Gap)
+end
+
+function Modelo_linear_Minz2_fixo_z1(z_1,a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.005)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+    #set_optimizer_attribute(modelo, "Cuts", 2)
+    #set_optimizer_attribute(modelo, "NodeMethod", 1)
+    #set_optimizer_attribute(modelo, "Heuristics", 0.25)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+    #@constraint(modelo,[i in 1:m,j in 1:k],
+    #x[i,j] == X[i,j]
+    #)
+
+    @constraint(modelo,
+    sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k) == z_1
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+
+    ############################################################################
+
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    x[i,j] <= sum(z[i,j,h] for h in H)
+    )
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    sum(z[i,j,h] for h in H) <= Φ*x[i,j]
+    )
+
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    zvalue = objective_value(modelo)
+    X = value.(x)
+    X = round.(Int.(X))
+    Z = value.(z)
+    Ω = value.(ω)
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+
+    return (zvalue,X,Z,Ω,Tempo,Gap)
+end
+
+function Modelo_linear1_Minz3_fixo_z1_z2(z_1,z_2,a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.01)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    x[i,j] == X[i,j]
+    )
+
+    @constraint(modelo,
+    sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k) == z_1
+    )
+
+    @constraint(modelo,
+    sum(sum(y[i,f] for f in 1:F) for i in 1:m) == z_2
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+    ############################################################################
+
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    x[i,j] <= sum(z[i,j,h] for h in H)
+    )
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    sum(z[i,j,h] for h in H) <= Φ*x[i,j]
+    )
+
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+    Num_var = 0#MOI.get(modelo,MOI.NumberOfVariables())
+    Num_res = 0#num_constraints(modelo,AffExpr,MOI.LessThan{Float64})+num_constraints(modelo,AffExpr,MOI.GreaterThan{Float64})+num_constraints(modelo,AffExpr,MOI.ZeroOne)
+    Nos = 0
+
+    z_1 = sum(ℓ[j]*(value(dmais[j]) + value(dmenos[j])) for j in 1:k)
+    z_2 = sum(sum(value(y[i,f]) for f in 1:F) for i in 1:m)
+    z_3 = sum(Preco[h]*Dist0[f]*(value(w[1,f,h]) + value(w[m,f,h])) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*value(u[i,f,fbar,h]) for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*value(u1[i,f,h]) for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*value(u2[i,f,h]) for i in 1:m-1 for f in 1:F for h in H)
+
+    X = value.(x)
+    Y = value.(y)
+    Z = value.(z)
+    W = value.(w)
+    Dmais = value.(dmais)
+    Dmenos = value.(dmenos)
+    Ω = value.(ω)
+
+    FileIO.save("X200cenario_3_1.jld2","RH",X)
+    FileIO.save("Y200cenario_3_1.jld2","RH",Y)
+    FileIO.save("Z200cenario_3_1.jld2","RH",Z)
+    FileIO.save("W200cenario_3_1.jld2","RH",W)
+    FileIO.save("Dmais200cenario_3_1.jld2","RH",Dmais)
+    FileIO.save("Dmenos200cenario_3_1.jld2","RH",Dmenos)
+
+    return (z_1,z_2,z_3,Gap,Nos,Tempo,X,Z,Ω)
+end
+
+################################################################################
+function Modelo_linear_Min_z2(a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.005)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+    ############################################################################
+
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    x[i,j] <= sum(z[i,j,h] for h in H)
+    )
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    sum(z[i,j,h] for h in H) <= Φ*x[i,j]
+    )
+
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    zvalue = objective_value(modelo)
+    X = value.(x)
+    Y = value.(y)
+    Y = round.(Int.(Y))
+    Z = value.(z)
+    Ω = value.(ω)
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+
+
+    return (zvalue,X,Z,Ω,Y,Tempo,Gap)
+end
+
+function Modelo_linear_Minz1_fixo_z2(z_2,a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,Y,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.005)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    y[i,f] == Y[i,f]
+    )
+
+
+    @constraint(modelo,
+    sum(sum(y[i,f] for f in 1:F) for i in 1:m)== z_2
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+    ############################################################################
+
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    x[i,j] <= sum(z[i,j,h] for h in H)
+    )
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    sum(z[i,j,h] for h in H) <= Φ*x[i,j]
+    )
+
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    zvalue = objective_value(modelo)
+    X = value.(x)
+    Z = value.(z)
+    Ω = value.(ω)
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+
+    return (zvalue,X,Z,Ω,Tempo,Gap)
+end
+
+function Modelo_linear2_Minz3_fixo_z1_z2(z_1,z_2,a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.01)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    x[i,j] == X[i,j]
+    )
+
+
+    @constraint(modelo,
+    sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k) == z_1
+    )
+
+    @constraint(modelo,
+    sum(sum(y[i,f] for f in 1:F) for i in 1:m) == z_2
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+    ############################################################################
+
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    x[i,j] <= sum(z[i,j,h] for h in H)
+    )
+    @constraint(modelo,[i in 1:m,j in 1:k],
+    sum(z[i,j,h] for h in H) <= Φ*x[i,j]
+    )
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+    Num_var = 0#MOI.get(modelo,MOI.NumberOfVariables())
+    Num_res = 9#num_constraints(modelo,AffExpr,MOI.LessThan{Float64})+
+    #num_constraints(modelo,AffExpr,MOI.GreaterThan{Float64})+
+    #num_constraints(modelo,AffExpr,MOI.ZeroOne)
+    Nos = 0
+
+    z_1 = sum(ℓ[j]*(value(dmais[j]) + value(dmenos[j])) for j in 1:k)
+    z_2 = sum(sum(value(y[i,f]) for f in 1:F) for i in 1:m)
+    z_3 = sum(Preco[h]*Dist0[f]*(value(w[1,f,h]) + value(w[m,f,h])) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*value(u[i,f,fbar,h]) for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*value(u1[i,f,h]) for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*value(u2[i,f,h]) for i in 1:m-1 for f in 1:F for h in H)
+
+
+    X = value.(x)
+    Y = value.(y)
+    Z = value.(z)
+    W = value.(w)
+    Ω = value.(ω)
+    Dmais = value.(dmais)
+    Dmenos = value.(dmenos)
+
+    FileIO.save("X200cenario_3_2.jld2","RH",X)
+    FileIO.save("Y200cenario_3_2.jld2","RH",Y)
+    FileIO.save("Z200cenario_3_2.jld2","RH",Z)
+    FileIO.save("W200cenario_3_2.jld2","RH",W)
+    FileIO.save("Dmais200cenario_3_2.jld2","RH",Dmais)
+    FileIO.save("Dmenos200cenario_3_2.jld2","RH",Dmenos)
+
+    return (z_1,z_2,z_3,Gap,Nos,Tempo,X,Z,Ω)
+end
+
+################################################################################
+
+function Sol_factivel(m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.005)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+    #set_optimizer_attribute(modelo, "MIPFocus", 2)
+    #set_optimizer_attribute(modelo, "Cuts", 2)
+
+    #set_optimizer_attribute(modelo, "NodeMethod", 2)
+    #set_optimizer_attribute(modelo, "MIPSepCuts", 2)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, sum(z[i,j,h] for i in 1:m for j in 1:k for h in H)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+
+    ############################################################################
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    zvalue = objective_value(modelo)
+    X = value.(x)
+    X = Int.(round.(X))
+    Z = value.(z)
+    Z = Int.(round.(Z))
+    Ω = value.(ω)
+    return (X,Z,Ω)
+end
+
+function Modelo_linear_Min_z3(a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.005)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+    #set_optimizer_attribute(modelo, "MIPFocus", 2)
+    #set_optimizer_attribute(modelo, "Cuts", 2)
+
+    #set_optimizer_attribute(modelo, "NodeMethod", 2)
+    #set_optimizer_attribute(modelo, "MIPSepCuts", 2)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+
+    ############################################################################
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    zvalue = objective_value(modelo)
+    X = value.(x)
+    Z = value.(z)
+    Z = value.(z)
+    Z = Int.(round.(Z))
+    Ω = value.(ω)
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+
+    return (zvalue,X,Z,Ω,Tempo,Gap)
+end
+
+function Modelo_linear_Minz1_fixo_z3(z_3,a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.005)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+    #set_optimizer_attribute(modelo, "MIPFocus", 2)
+    #set_optimizer_attribute(modelo, "Cuts", 2)
+
+    #set_optimizer_attribute(modelo, "NodeMethod", 2)
+    #set_optimizer_attribute(modelo, "MIPSepCuts", 2)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+    #@constraint(modelo,[i in 1:m,j in 1:k,h in H],
+    #z[i,j,h] == Z[i,j,h]
+    #)
+
+
+
+    @constraint(modelo,
+    sum(Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H)  <= 1.01*z_3
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+
+    ############################################################################
+
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    zvalue = objective_value(modelo)
+    X = value.(x)
+    Z = value.(z)
+    X = Int.(round.(X))
+    Ω = value.(ω)
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+
+    return (zvalue,X,Z,Ω,Tempo,Gap)
+end
+
+function Modelo_linear3_Minz2_fixo_z1_z3(z_1,z_3,a1,a2,a3,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+    set_optimizer_attribute(modelo, "MIPGap", 0.01)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+    #set_optimizer_attribute(modelo, "MIPFocus", 2)
+    #set_optimizer_attribute(modelo, "Cuts", 2)
+
+    #set_optimizer_attribute(modelo, "NodeMethod", 2)
+    #set_optimizer_attribute(modelo, "MIPSepCuts", 2)
+
+    @variable(modelo, t[j in 1:k] >=0,Int)
+    @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+    @variable(modelo, dmais[j in 1:k] >=0)
+    @variable(modelo, dmenos[j in 1:k] >=0)
+    @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+    @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+    @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+    @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+    @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+    @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+
+    @objective(modelo,Min, a1 * sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k)  + a2* sum( sum(y[i,f] for f in 1:F) for i in 1:m)+
+    a3*( sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) )
+    )
+
+    @constraint(modelo,[i in 1:m,j in 1:k,h in H],
+    x[i,j] == X[i,j]
+    )
+
+    @constraint(modelo,
+    sum( ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k) <= 1.01*z_1
+    )
+
+    @constraint(modelo,
+    sum(Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+    sum(Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H)  <= 1.01*z_3
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+    )
+
+    @constraint(modelo,[j in 1:k],
+    t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+    )
+
+    @constraint(modelo,[j in 1:k],
+    sum(x[i,j] for i in 1:m) == 1
+    )
+
+    @constraint(modelo,[i in 1:m],
+    sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+    x[i,j] <= y[i,f]
+    )
+
+    @constraint(modelo,[i in 1:m, f in 1:F],
+    y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #Definição de w
+    @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+    sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+    )
+
+    #########
+    #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+    @constraint(modelo,[i in 1:m,h in H],
+    sum(z[i,j,h] for j in 1:k) <= 1
+    )
+
+    ############################################################################
+    @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+    z[i,j,h] <= x[i,j]
+    )
+
+    @constraint(modelo,[i in 1:m,f in 1:F],
+    3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+    )
+
+    #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+    #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+    #)
+
+    ############################################################################
+
+    #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+    @constraint(modelo,[j in 1:k],
+    sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+    )
+
+    #Linearizações
+    ################################################################################
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+    2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+    )
+    ################################################################################
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+    @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+    2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+    )
+
+
+    if size(X,1) > 0
+        for i in 1:m, j in 1:k, h in H
+            set_start_value(z[i,j,h], Z[i,j,h])
+        end
+        for i in 1:m, j in 1:k
+            set_start_value(x[i,j], X[i,j])
+        end
+        for j in 1:k,i in I1[j]:I2[j]
+            set_start_value(ω[j,i], Ω[j,i])
+        end
+    end
+
+    status=optimize!(modelo)
+
+    Tempo = solve_time(modelo)
+    Gap = relative_gap(modelo)
+
+    Num_var = 0 #MOI.get(modelo,MOI.NumberOfVariables())
+    Num_res = 0 #num_constraints(modelo,AffExpr,MOI.LessThan{Float64})+
+    #num_constraints(modelo,AffExpr,MOI.GreaterThan{Float64})+
+    #num_constraints(modelo,AffExpr,MOI.ZeroOne)
+    Nos = 0
+
+    z_1 = sum(ℓ[j]*(value(dmais[j]) + value(dmenos[j])) for j in 1:k)
+    z_2 = sum(sum(value(y[i,f]) for f in 1:F) for i in 1:m)
+    z_3 = sum(Preco[h]*Dist0[f]*(value(w[1,f,h]) + value(w[m,f,h])) for f in 1:F for h in H) +
+    sum(Preco[h]*Dist[f,fbar]*value(u[i,f,fbar,h]) for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+    sum(Preco[h]*Dist0[f]*value(u1[i,f,h]) for i in 1:m-1 for f in 1:F for h in H)+
+    sum(Preco[h]*Dist0[f]*value(u2[i,f,h]) for i in 1:m-1 for f in 1:F for h in H)
+
+    X = value.(x)
+    Y = value.(y)
+    Z = value.(z)
+    W = value.(w)
+    Ω = value.(ω)
+    Dmais = value.(dmais)
+    Dmenos = value.(dmenos)
+
+    FileIO.save("X200cenario_3_3.jld2","RH",X)
+    FileIO.save("Y200cenario_3_3.jld2","RH",Y)
+    FileIO.save("Z200cenario_3_3.jld2","RH",Z)
+    FileIO.save("W200cenario_3_3.jld2","RH",W)
+    FileIO.save("Dmais200cenario_3_3.jld2","RH",Dmais)
+    FileIO.save("Dmenos200cenario_3_3.jld2","RH",Dmenos)
+
+    return (z_1,z_2,z_3,Gap,Nos,Tempo,X,Z,Ω)
+end
+
+
+function Modelo_linear_compromisso2(c1maxG,c1minG,c2maxG,c2minG,c3maxG,c3minG,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime)
+
+        modelo = Model(Gurobi.Optimizer)
+        set_optimizer_attribute(modelo, "TimeLimit",CPUtime)
+        set_optimizer_attribute(modelo, "MIPGap", 0.005)
+        set_optimizer_attribute(modelo, "DisplayInterval", 20)
+        #set_optimizer_attribute(modelo, "MIPFocus", 2)
+        #set_optimizer_attribute(modelo, "Cuts", 2)
+
+        #set_optimizer_attribute(modelo, "NodeMethod", 2)
+        #set_optimizer_attribute(modelo, "MIPSepCuts", 2)
+
+        @variable(modelo, t[j in 1:k] >=0,Int)
+        @variable(modelo, ω[j in 1:k,i in I1[j]:I2[j]], Bin)
+        @variable(modelo, dmais[j in 1:k] >=0)
+        @variable(modelo, dmenos[j in 1:k] >=0)
+        @variable(modelo, x[i in 1:m,j in 1:k], Bin)
+        @variable(modelo, y[i in 1:m,j in 1:F], Bin)
+        @variable(modelo, z[i in 1:m,j in 1:k,h in H], Bin)
+        @variable(modelo, w[i in 1:m,f in 1:F,h in H], Bin)
+        @variable(modelo, 0 <= u[i in 1:m-1,f in 1:F,fbar in 1:F,h in H], Bin)
+        @variable(modelo, u1[i in 1:m-1,f in 1:F,h in H], Bin)
+        @variable(modelo, u2[i in 1:m-1,f in 1:F,h in H], Bin)
+        @variable(modelo, 0 <= e[j in 1:k] <= minimum(C.*Lmax) )
+        @variable(modelo, v>=0 )
+
+
+        @objective(modelo,Min,v)
+
+        @constraint(modelo,
+        (sum(ℓ[j]*(dmais[j] + dmenos[j]) for j in 1:k) - c1minG)/(c1maxG-c1minG) <= v
+        )
+
+        @constraint(modelo,
+        (sum(y[i,f] for f in 1:F for i in 1:m) - c2minG)/(c2maxG-c2minG) <= v
+        )
+
+        @constraint(modelo,
+        (sum(Preco[h]*Dist0[f]*(w[1,f,h] + w[m,f,h]) for f in 1:F for h in H) +
+        sum(Preco[h]*Dist[f,fbar]*u[i,f,fbar,h] for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+        sum(Preco[h]*Dist0[f]*u1[i,f,h] for i in 1:m-1 for f in 1:F for h in H)+
+        sum(Preco[h]*Dist0[f]*u2[i,f,h] for i in 1:m-1 for f in 1:F for h in H) - c3minG)/(c3maxG-c3minG) <= v
+        )
+
+        @constraint(modelo,[j in 1:k],
+        sum( GDA_mensal[j,i]*ω[j,i] for i in I1[j]:I2[j] ) == GD_otimo[j] + dmais[j] - dmenos[j]
+        )
+
+        @constraint(modelo,[j in 1:k],
+        t[j] + t0[j] == sum(T[i]*x[i,j] for i in 1:m)
+        )
+
+        @constraint(modelo,[j in 1:k],
+        t[j] == sum(i*ω[j,i] for i in I1[j]:I2[j])
+        )
+
+        @constraint(modelo,[j in 1:k],
+        sum(ω[j,i] for i in I1[j]:I2[j]) == 1
+        )
+
+        @constraint(modelo,[j in 1:k],
+        sum(x[i,j] for i in 1:m) == 1
+        )
+
+        @constraint(modelo,[i in 1:m],
+        sum(P[j]*L[j]*x[i,j] for j in 1:k) >= D[i]
+        )
+
+        @constraint(modelo,[i in 1:m, f in 1:F, j in sum(r[1:f-1])+1:sum(r[1:f])],
+        x[i,j] <= y[i,f]
+        )
+
+        @constraint(modelo,[i in 1:m, f in 1:F],
+        y[i,f] <= sum(x[i,j] for j in sum(r[1:f-1])+1:sum(r[1:f]))
+        )
+
+        #Definição de w
+        @constraint(modelo,[i in 1:m,f in 1:F,h in H],
+        sum(z[i,j,h] for j in sum(r[1:f-1])+1:sum(r[1:f])) == w[i,f,h]
+        )
+
+        #########
+        #Em cada período, cada máquina é designada no máximo 1 vez em cada fazenda
+        @constraint(modelo,[i in 1:m,h in H],
+        sum(z[i,j,h] for j in 1:k) <= 1
+        )
+
+        ############################################################################
+        @constraint(modelo,[i in 1:m,h in H,j in 1:k],
+        z[i,j,h] <= x[i,j]
+        )
+
+        @constraint(modelo,[i in 1:m,f in 1:F],
+        3*y[i,f] <= sum(z[i,j,h] for h in H for j in sum(r[1:f-1])+1:sum(r[1:f]))
+        )
+
+        #@constraint(modelo,[i in 1:m-2, j in 1:k,h in H],
+        #z[i,j,h] + z[i+2,j,h] <= 1 + z[i+1,j,h]
+        #)
+
+        ############################################################################
+        #As máquinas devem fazer a colheita de toda a cana em cada fazenda
+        @constraint(modelo,[j in 1:k],
+        sum(Lmax[i]*C[h]*z[i,j,h] for i in 1:m for h in H) >= P[j]*L[j]
+        )
+
+        #Linearizações
+        ################################################################################
+        @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+        u[i,f,fbar,h] + 1 >= w[i,fbar,h] + w[i+1,f,h]
+        )
+
+        @constraint(modelo,[i in 1:m-1, f in 1:F, fbar in 1:F, h in H],
+        2*u[i,f,fbar,h] <= w[i,fbar,h] + w[i+1,f,h]
+        )
+        ################################################################################
+
+        @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+        u1[i,f,h] >= w[i+1,f,h] - sum(w[i,fbar,h] for fbar in 1:F)
+        )
+
+        @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+        2*u1[i,f,h] <= w[i+1,f,h] + 1 - sum(w[i,fbar,h] for fbar in 1:F)
+        )
+        ################################################################################
+
+        @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+        u2[i,f,h] >= w[i,f,h] - sum(w[i+1,fbar,h] for fbar in 1:F)
+        )
+
+        @constraint(modelo,[i in 1:m-1, f in 1:F, h in H],
+        2*u2[i,f,h] <= w[i,f,h] + 1 - sum(w[i+1,fbar,h] for fbar in 1:F)
+        )
+
+        if size(X,1) > 0
+            for i in 1:m, j in 1:k, h in H
+                set_start_value(z[i,j,h], Z[i,j,h])
+            end
+            for i in 1:m, j in 1:k
+                set_start_value(x[i,j], X[i,j])
+            end
+            for j in 1:k,i in I1[j]:I2[j]
+                set_start_value(ω[j,i], Ω[j,i])
+            end
+        end
+
+        status=optimize!(modelo)
+        Tempo = solve_time(modelo)
+        Gap = relative_gap(modelo)
+
+        Num_var = 0 #MOI.get(modelo,MOI.NumberOfVariables())
+        Num_res = 0 #num_constraints(modelo,AffExpr,MOI.LessThan{Float64})+
+        #num_constraints(modelo,AffExpr,MOI.GreaterThan{Float64})+
+        #num_constraints(modelo,AffExpr,MOI.ZeroOne)
+        Nos = 0
+
+        z_1 = sum(ℓ[j]*(value(dmais[j]) + value(dmenos[j])) for j in 1:k)
+        z_2 = sum(sum(value(y[i,f]) for f in 1:F) for i in 1:m)
+        z_3 = sum(Preco[h]*Dist0[f]*(value(w[1,f,h]) + value(w[m,f,h])) for f in 1:F for h in H) +
+        sum(Preco[h]*Dist[f,fbar]*value(u[i,f,fbar,h]) for i in 1:m-1 for f in 1:F for fbar in setdiff(1:F,f) for h in H)+
+        sum(Preco[h]*Dist0[f]*value(u1[i,f,h]) for i in 1:m-1 for f in 1:F for h in H)+
+        sum(Preco[h]*Dist0[f]*value(u2[i,f,h]) for i in 1:m-1 for f in 1:F for h in H)
+
+        X = value.(x)
+        Y = value.(y)
+        Z = value.(z)
+        W = value.(w)
+        Ω = value.(ω)
+        Dmais = value.(dmais)
+        Dmenos = value.(dmenos)
+
+        FileIO.save("X200cenario_3_4.jld2","RH",X)
+        FileIO.save("Y200cenario_3_4.jld2","RH",Y)
+        FileIO.save("Z200cenario_3_4.jld2","RH",Z)
+        FileIO.save("W200cenario_3_4.jld2","RH",W)
+        FileIO.save("Dmais200cenario_3_4.jld2","RH",Dmais)
+        FileIO.save("Dmenos200cenario_3_4.jld2","RH",Dmenos)
+
+        return (z_1,z_2,z_3,Gap,Nos,Tempo,X,Z,Ω)
+
+end
+
+
+#Solução 1
+(z_1,X1,Z1,Ω1,Tempo1,Gap1) = Modelo_linear_Min_z1(1,0,0,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,[],[],[],CPUtime);
+(z_2,X2,Z2,Ω2,Tempo2,Gap2) = Modelo_linear_Minz2_fixo_z1(z_1,0,1,0,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X1,Z1,Ω1,CPUtime);
+(z_11,z_12,z_13,Gap3,Nos3,Tempo3,X,Z,Ω) = Modelo_linear1_Minz3_fixo_z1_z2(z_1,z_2,0,0,1,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X2,Z2,Ω2,CPUtime);
+
+#Solução 2
+(z_2,X3,Z3,Ω3,Y,Tempo4,Gap4) = Modelo_linear_Min_z2(0,1,0,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,[],[],[],CPUtime);
+(z_1,X4,Z4,Ω4,Tempo5,Gap5) = Modelo_linear_Minz1_fixo_z2(z_2,1,0,0,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X3,Z3,Ω3,Y,CPUtime/2);
+(z_21,z_22,z_23,Gap6,Nos6,Tempo6,X,Z,Ω) = Modelo_linear2_Minz3_fixo_z1_z2(z_1,z_2,0,0,1,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X4,Z4,Ω4,CPUtime/2);
+
+#Solução 3
+(X0,Z0,Ω0) = Sol_factivel(m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X,Z,Ω,CPUtime);
+(z_3,X5,Z5,Ω5,Tempo7,Gap7) = Modelo_linear_Min_z3(0,0,1,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X0,Z0,Ω0,CPUtime);
+(z_1,X6,Z6,Ω6,Tempo8,Gap8) = Modelo_linear_Minz1_fixo_z3(z_3,1,0,0,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X5,Z5,Ω5,CPUtime/2);
+(z_31,z_32,z_33,Gap9,Nos9,Tempo9,X,Z,Ω) = Modelo_linear3_Minz2_fixo_z1_z3(z_1,z_3,0,1,0,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X6,Z6,Ω6,CPUtime/2);
+
+#Solução 4
+c1maxG = maximum([z_11 z_21 z_31])
+c1minG = minimum([z_11 z_21 z_31])
+
+c2maxG = maximum([z_12 z_22 z_32])
+c2minG = minimum([z_12 z_22 z_32])
+
+c3maxG = maximum([z_13 z_23 z_33])
+c3minG = minimum([z_13 z_23 z_33])
+
+ρ = 10^-4
+
+(z_41,z_42,z_43,Gap10,Nos10,Tempo10,X,Z,Ω) = Modelo_linear_compromisso2(c1maxG,c1minG,c2maxG,c2minG,c3maxG,c3minG,m,k,F,t0,t_otimo,P,T,D,GDA_mensal,GD_otimo,I1,I2,r,ℓ,Dist,Dist0,Preco,Lmax,Φ,C,H,X0,Z0,Ω0,CPUtime)
