@@ -1,0 +1,184 @@
+using Printf, Random,JuMP, Gurobi, Printf
+using FileIO, JLD2, LinearAlgebra
+using Statistics
+rng = MersenneTwister(2020);
+
+function Fase_2(i,X,Z,T,t0,I1,I2,k,H,GDA_diario,GD_otimo,D,C,P,L,Φ)
+
+    duracao = Int.(round.([sum(T[i]*X[i,j] for i in 1:m) - t0[j] for j in 1:k]))
+
+    #duracao = Int.(round.([sum(i*Ω[j,i] for i in I1[j]:I2[j]) for j in 1:k]))
+
+    plots = findall(X[i,:].>0)
+    Maquinas = zeros(k,Φ)
+
+    for j in plots
+        for h in H
+            if Z[i,j,h].>0
+                Maquinas[j,h] = 1
+            end
+        end
+    end
+
+    GD_acumulados_no_mes = zeros(k,30)
+    Desvios_no_mes = zeros(k,30)
+    for j in plots
+        for i in 1:30
+            GD_acumulados_no_mes[j,i] = GDA_diario[j,(duracao[j]-1)*30 + i]
+            Desvios_no_mes[j,i] = abs(GD_acumulados_no_mes[j,i] - GD_otimo[j])
+        end
+    end
+
+    Meio_de_semana = [2,3,4,5,8,9,10,11,14,15,16,17,20,21,22,23,26,27,28,29
+    ]
+    Fim_de_semana = [1,6,7,12,13,18,19,24,25,30]
+
+    Dem_diaria = D[1]*ones(30)/30
+
+    modelo = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(modelo, "TimeLimit",60)
+    set_optimizer_attribute(modelo, "MIPGap", 0.005)
+    set_optimizer_attribute(modelo, "DisplayInterval", 20)
+
+    @variable(modelo, 0<= λ[i in 1:30,j in plots,h in findall(Maquinas[j,:] .>0)])
+
+    @objective(modelo,Min, sum( Desvios_no_mes[j,i]*λ[i,j,h] for i in 1:30 for j in plots for h in findall(Maquinas[j,:] .>0))
+    )
+
+    @constraint(modelo,[j in plots],
+    sum(C[h]*λ[i,j,h] for i in 1:30 for h in findall(Maquinas[j,:] .>0)) .==  P[j]*L[j]
+    )
+
+    @constraint(modelo,[i in Meio_de_semana,j in plots,h in findall(Maquinas[j,:] .>0)],
+    λ[i,j,h] <=  12
+    )
+
+    @constraint(modelo,[i in Fim_de_semana,j in plots,h in findall(Maquinas[j,:] .>0)],
+    λ[i,j,h] <=  12
+    )
+
+    status=optimize!(modelo)
+
+    Λ = value.(λ)
+
+    #------------------------------------------------------------------------------
+
+    Soma_horas_plot = [sum(Λ[i,j,h] for i in 1:30 for h in findall(Maquinas[j,:] .>0)) for j in plots]
+
+    #------------------------------------------------------------------------------
+
+    Num_per = zeros(length(plots))
+    l=1
+    for j in plots
+        s = 0
+        for i in 1:30
+            if sum(Λ[i,j,h] for h in findall(Maquinas[j,:] .>0)) > 0
+                s = s + 1
+            end
+        end
+        Num_per[l] = s
+        l=l+1
+    end
+    #-----------------------------------------------------------------------------
+
+    Horas_por_maq=zeros(length(plots),2)
+    l=1
+    for j in plots
+        s1 = 0; s2 = 0;
+        for h in findall(Maquinas[j,:] .>0)
+            if h <=Φ/2
+               s1 = s1 + sum(Λ[i,j,h] for i in 1:30)
+            else
+               s2 = s2 + sum(Λ[i,j,h] for i in 1:30)
+           end
+        end
+        Horas_por_maq[l,1] = s1
+        Horas_por_maq[l,2] = s2
+        l=l+1
+    end
+    #-----------------------------------------------------------------------------
+    Num_de_maq = zeros(length(plots),2)
+    l=1
+    for j in plots
+        s1 = 0; s2 = 0;
+        for h in intersect(findall(Maquinas[j,:] .>0),1:Int(Φ/2))
+            if sum(Λ[i,j,h] for i in 1:30) > 0
+                s1 = s1 + 1
+            end
+        end
+        for h in intersect(findall(Maquinas[j,:] .>0),Int(Φ/2):Int(Φ))
+            if sum(Λ[i,j,h] for i in 1:30) > 0
+                s2 = s2 + 1
+            end
+        end
+        Num_de_maq[l,1] = s1
+        Num_de_maq[l,2] = s2
+        l=l+1
+    end
+    #-----------------------------------------------------------------------------
+
+    Num_medio_maq_plot=zeros(length(plots))
+    l=1
+    for j in plots
+        ind = findall(Num_de_maq[l,:] .> 0)
+        Num_medio_maq_plot[l] = mean(Num_de_maq[l,ind])
+        l=l+1
+    end
+    #-----------------------------------------------------------------------------
+    Quantidade_colhida_por_hora = zeros(length(plots))
+    l=1
+    for j in plots
+        Quantidade_colhida_por_hora[l] = (P[j]*L[j])/Soma_horas_plot[l]
+        l=l+1
+    end
+
+    #-----------------------------------------------------------------------------
+    Trabalho_por_maquina = zeros(length(plots),2)
+    l=1
+    for j in plots
+        for k in 1:2
+            if Num_de_maq[l,k] > 0
+                Trabalho_por_maquina[l,k] = Horas_por_maq[l,k]/Num_de_maq[l,k]
+            end
+        end
+        l=l+1
+    end
+    #-----------------------------------------------------------------------------
+
+    Media_trabalho_por_maquina=zeros(length(plots))
+    l=1;
+    for j in plots
+        ind = findall(Trabalho_por_maquina[l,:] .> 0)
+        Media_trabalho_por_maquina[l] = mean(Trabalho_por_maquina[l,ind])
+        l=l+1
+    end
+
+    #-----------------------------------------------------------------------------
+    Desv_mes=zeros(length(plots))
+    l=1;
+    for j in plots
+        Desv_mes[l] = sum(Desvios_no_mes[j,i]*Λ[i,j,h] for i in 1:30 for h in findall(Maquinas[j,:] .>0))/sum(Λ[i,j,h] for i in 1:30 for h in findall(Maquinas[j,:] .>0))
+        l=l+1
+    end
+
+    return (Soma_horas_plot,Num_per,Num_medio_maq_plot,Quantidade_colhida_por_hora,Media_trabalho_por_maquina,Desv_mes)
+end
+
+function Todos_meses(X,Z,I1,I2,k,H,GDA_diario,GD_otimo,D,C,P,L,Φ)
+    SOMA_HORAS=Float64[]
+    NUM_PER=Float64[]
+    NUM_MEDIO_MAQ=Float64[]
+    QDADE_COLH_POR_HORA=Float64[]
+    TEMPO_MAQUINA=Float64[]
+    DESV_GD=Float64[]
+    for i in 1:m
+        (Soma_Horas,Num_per,Num_Medio_Maq,Qdade_colh_por_hora,Tempo_Maquina,Desv_GD) = Fase_2(i,X,Z,T,t0,I1,I2,k,H,GDA_diario,GD_otimo,D,C,P,L,Φ)
+        SOMA_HORAS = [SOMA_HORAS;Soma_Horas]
+        NUM_PER = [NUM_PER;Num_per]
+        NUM_MEDIO_MAQ = [NUM_MEDIO_MAQ;Num_Medio_Maq]
+        QDADE_COLH_POR_HORA=[QDADE_COLH_POR_HORA;Qdade_colh_por_hora]
+        TEMPO_MAQUINA=[TEMPO_MAQUINA;Tempo_Maquina]
+        DESV_GD=[DESV_GD;Desv_GD]
+    end
+    return (SOMA_HORAS,NUM_PER,NUM_MEDIO_MAQ,QDADE_COLH_POR_HORA,TEMPO_MAQUINA,DESV_GD)
+end
